@@ -23,7 +23,7 @@ namespace evmc
 /// The big-endian 160-bit hash suitable for keeping an Ethereum address.
 ///
 /// This type wraps C ::evmc_address to make sure objects of this type are always initialized.
-struct address : evmc_address
+struct alignas(uint32_t) address : evmc_address
 {
     /// Default and converting constructor.
     ///
@@ -67,7 +67,7 @@ struct address : evmc_address
 /// The fixed size array of 32 bytes for storing 256-bit EVM values.
 ///
 /// This type wraps C ::evmc_bytes32 to make sure objects of this type are always initialized.
-struct bytes32 : evmc_bytes32
+struct alignas(size_t) bytes32 : evmc_bytes32
 {
     /// Default and converting constructor.
     ///
@@ -170,9 +170,20 @@ inline constexpr uint64_t fnv1a_by64(uint64_t h, uint64_t x) noexcept
 /// The "equal to" comparison operator for the evmc::address type.
 inline constexpr bool operator==(const address& a, const address& b) noexcept
 {
+#if defined(SP1TURBO) || defined(SP1)
+    using W = uint32_t;
+    const auto aw = reinterpret_cast<const W*>(&a);
+    const auto bw = reinterpret_cast<const W*>(&b);
+
+    for (size_t i = 0; i < (sizeof(a) / sizeof(W)); ++i)
+        if (aw[i] != bw[i])
+            return false;
+    return true;
+#else
     return load64le(&a.bytes[0]) == load64le(&b.bytes[0]) &&
            load64le(&a.bytes[8]) == load64le(&b.bytes[8]) &&
            load32le(&a.bytes[16]) == load32le(&b.bytes[16]);
+#endif
 }
 
 /// The "not equal to" comparison operator for the evmc::address type.
@@ -212,10 +223,21 @@ inline constexpr bool operator>=(const address& a, const address& b) noexcept
 /// The "equal to" comparison operator for the evmc::bytes32 type.
 inline constexpr bool operator==(const bytes32& a, const bytes32& b) noexcept
 {
+#if defined(SP1TURBO) || defined(SP1)
+    using W = size_t;
+    const auto aw = reinterpret_cast<const W*>(&a);
+    const auto bw = reinterpret_cast<const W*>(&b);
+
+    for (size_t i = 0; i < (sizeof(a) / sizeof(W)); ++i)
+        if (aw[i] != bw[i])
+            return false;
+    return true;
+#else
     return load64le(&a.bytes[0]) == load64le(&b.bytes[0]) &&
            load64le(&a.bytes[8]) == load64le(&b.bytes[8]) &&
            load64le(&a.bytes[16]) == load64le(&b.bytes[16]) &&
            load64le(&a.bytes[24]) == load64le(&b.bytes[24]);
+#endif
 }
 
 /// The "not equal to" comparison operator for the evmc::bytes32 type.
@@ -931,11 +953,21 @@ struct hash<evmc::address>
     /// Hash operator using FNV1a-based folding.
     constexpr size_t operator()(const evmc::address& s) const noexcept
     {
+#if defined(SP1TURBO) || defined(SP1)
+        using W = uint32_t;
+        const auto sw = reinterpret_cast<const W*>(&s);
+
+        W fold = 0x811c9dc5;
+        for (size_t i = 0; i < sizeof(s) / sizeof(W); ++i)
+            fold = (fold ^ sw[i]) * 0x01000193;
+        return fold;
+#else
         using namespace evmc;
         using namespace fnv;
         return static_cast<size_t>(fnv1a_by64(
             fnv1a_by64(fnv1a_by64(fnv::offset_basis, load64le(&s.bytes[0])), load64le(&s.bytes[8])),
             load32le(&s.bytes[16])));
+#endif
     }
 };
 
@@ -946,6 +978,15 @@ struct hash<evmc::bytes32>
     /// Hash operator using FNV1a-based folding.
     constexpr size_t operator()(const evmc::bytes32& s) const noexcept
     {
+#if defined(SP1TURBO) || defined(SP1)
+        using W = size_t;
+        const auto sw = reinterpret_cast<const W*>(&s);
+
+        W fold = 0x811c9dc5;
+        for (size_t i = 0; i < sizeof(s) / sizeof(W); ++i)
+            fold = (fold ^ sw[i]) * 0x01000193;
+        return fold;
+#else
         using namespace evmc;
         using namespace fnv;
         return static_cast<size_t>(
@@ -953,6 +994,7 @@ struct hash<evmc::bytes32>
                                              load64le(&s.bytes[8])),
                                   load64le(&s.bytes[16])),
                        load64le(&s.bytes[24])));
+#endif
     }
 };
 }  // namespace std
