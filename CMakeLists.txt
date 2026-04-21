@@ -4,12 +4,9 @@
 
 cmake_minimum_required(VERSION 3.19...4.2)
 
-if(NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/evmc/.git)
-    message(FATAL_ERROR "Git submodules not initialized, execute:\n  git submodule update --init")
-endif()
-
 option(BUILD_SHARED_LIBS "Build evmone as a shared library" ON)
 option(COVERAGE "Build with coverage instrumentation" OFF)
+option(ASSERTIONS "Force enable the assertions in the code ignoring the CMAKE_BUILD_TYPE default" OFF)
 option(EVMONE_TESTING "Build tests and test tools" OFF)
 option(EVMONE_FUZZING "Instrument libraries and build fuzzing tools" OFF)
 
@@ -26,7 +23,7 @@ cable_set_build_type(DEFAULT Release CONFIGURATION_TYPES Release Debug)
 include(Hunter/init)
 
 project(evmone LANGUAGES CXX C)
-set(PROJECT_VERSION 0.19.0)
+set(PROJECT_VERSION 0.20.0)
 
 string(REGEX MATCH "([0-9]+)\\.([0-9]+)" _ ${PROJECT_VERSION})
 set(PROJECT_VERSION_MAJOR ${CMAKE_MATCH_1})
@@ -38,7 +35,9 @@ if(PROJECT_VERSION_MAJOR EQUAL 0)
 endif()
 
 option(EVMC_TOOLS "Build EVMC test tools" ${EVMONE_TESTING})
-option(EVMC_INSTALL "Install EVMC" OFF)
+
+hunter_add_package(CLI11)
+find_package(CLI11 CONFIG REQUIRED)
 
 if(COMMAND block) # TODO(cmake-3.25)
     block()
@@ -89,6 +88,18 @@ if(COVERAGE)
         $<$<CXX_COMPILER_ID:GNU>:--coverage>
         $<$<CXX_COMPILER_ID:Clang,AppleClang>:-fprofile-instr-generate>
     )
+endif()
+
+if(ASSERTIONS)
+    if(CMAKE_CONFIGURATION_TYPES)
+        message(FATAL_ERROR "ASSERTIONS option is not supported with multi-configuration generators")
+    endif()
+    # Remove -DNDEBUG from default build type flags.
+    string(TOUPPER "${CMAKE_BUILD_TYPE}" BUILD_TYPE_UPPER)
+    get_property(ENABLED_LANGUAGES GLOBAL PROPERTY ENABLED_LANGUAGES)
+    foreach(LANG IN LISTS ENABLED_LANGUAGES)
+        string(REGEX REPLACE " *-DNDEBUG" "" CMAKE_${LANG}_FLAGS_${BUILD_TYPE_UPPER} "${CMAKE_${LANG}_FLAGS_${BUILD_TYPE_UPPER}}")
+    endforeach()
 endif()
 
 set(CMAKE_C_VISIBILITY_PRESET hidden)
@@ -155,9 +166,6 @@ endif()
 set(install_targets evmone)
 if(TARGET evmone-standalone)
     list(APPEND install_targets evmone-standalone)
-endif()
-if(TARGET evm-test)
-    list(APPEND install_targets evm-test)
 endif()
 if(TARGET evmone-bench)
     list(APPEND install_targets evmone-bench)
