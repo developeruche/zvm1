@@ -270,6 +270,36 @@ constexpr sp1_AffinePoint sp1_G = {
 };
 #endif
 
+/// Add non-zero p to non-zero r with first-limb fast reject on x-coordinate.
+[[gnu::always_inline]] inline bool sp1_secp256k1_add_nz(sp1_AffinePoint r, const sp1_AffinePoint p) noexcept
+{
+    // Quick reject on first limb of x-coordinate (~1/2^64 false positive).
+    if (r[0] != p[0]) [[likely]]
+    {
+        syscall_secp256k1_add(r, p);
+        return true;
+    }
+    // Full x-coordinate comparison (only reached ~1/2^64 of the time).
+    if (reinterpret_cast<const uint256&>(r[0]) != reinterpret_cast<const uint256&>(p[0])) [[likely]]
+    {
+        syscall_secp256k1_add(r, p);
+        return true;
+    }
+
+    const auto& ry = reinterpret_cast<const uint256&>(r[SP1_POINT_SIZE / 2]);
+    const auto& py = reinterpret_cast<const uint256&>(p[SP1_POINT_SIZE / 2]);
+    if (ry == py)
+    {
+        syscall_secp256k1_double(r);
+        return true;
+    }
+    else
+    {  // r == -p
+        std::fill_n(r, SP1_POINT_SIZE, 0);
+        return false;  // r becomes zero
+    }
+}
+
 /// Add p to r, handling edge cases that SP1 syscall doesn't support:
 /// zero points (infinity) and points with the same x-coordinate.
 void sp1_secp256k1_add(sp1_AffinePoint r, const sp1_AffinePoint p) noexcept
@@ -282,38 +312,69 @@ void sp1_secp256k1_add(sp1_AffinePoint r, const sp1_AffinePoint p) noexcept
         return;
     }
 
-    const auto& rx = reinterpret_cast<const uint256&>(r[0]);
-    const auto& px = reinterpret_cast<const uint256&>(p[0]);
-    if (rx == px) [[unlikely]]
+    sp1_secp256k1_add_nz(r, p);
+}
+
+/// SP1 version of ecc::msm() — computes multi-scalar multiplication u×P + v×Q
+/// using SP1 syscalls for point operations.
+/// See: ecc.hpp::msm(), https://eprint.iacr.org/2003/257.pdf#page=7.
+void sp1_msm(sp1_AffinePoint r, const uint256& u, const sp1_AffinePoint p,
+    const uint256& v, const sp1_AffinePoint q) noexcept
+{
+    // Precompute affine P + Q (safe add handles P==Q, P==-Q, and zero points).
+    sp1_AffinePoint h;
+    std::copy_n(p, SP1_POINT_SIZE, h);
+    sp1_secp256k1_add(h, q);
+
+    // Lookup table: index = (v_bit << 1) | u_bit.
+    const uint64_t* points[4] = {nullptr, p, q, h};
+
+    // Find the bit width across both scalars simultaneously.
+    const auto bw = std::max(intx::bit_width(u), intx::bit_width(v));
+
+    if (bw == 0)
     {
-        const auto& ry = reinterpret_cast<const uint256&>(r[SP1_POINT_SIZE / 2]);
-        const auto& py = reinterpret_cast<const uint256&>(p[SP1_POINT_SIZE / 2]);
-        if (ry == py)
-            syscall_secp256k1_double(r);
-        else  // r == -p
-            std::fill_n(r, SP1_POINT_SIZE, 0);
+        std::fill_n(r, SP1_POINT_SIZE, 0);
         return;
     }
 
-    syscall_secp256k1_add(r, p);
-}
+    // Find the first non-zero index to initialize the accumulator.
+    size_t i = bw;
+    for (; i != 0; --i)
+    {
+        const auto idx =
+            2 * unsigned{intx::bit_test(v, i - 1)} + unsigned{intx::bit_test(u, i - 1)};
+        if (idx != 0)
+        {
+            std::copy_n(points[idx], SP1_POINT_SIZE, r);
+            --i;
+            break;
+        }
+    }
 
-void sp1_mul(sp1_AffinePoint r, const sp1_AffinePoint p, uint256 c) noexcept
-{
-    std::fill_n(r, SP1_POINT_SIZE, 0);
-    const auto bit_width = sizeof(c) * 8 - intx::clz(c);
-
-    if (bit_width == 0)
-        return;
-
-    std::copy_n(p, SP1_POINT_SIZE, r);  // r = p
-    for (auto i = bit_width - 1; i != 0; --i)
+    // Main loop: double-and-add. Zero-point checks skipped (accumulator and
+    // table points are always non-zero), only same-x check via _nz helper.
+    bool nz = true;
+    for (; i != 0 && nz; --i)
     {
         syscall_secp256k1_double(r);
-        if (evmmax::ecc::test_bit(c, i - 1))
-            syscall_secp256k1_add(r, p);
+        const auto idx =
+            2 * unsigned{intx::bit_test(v, i - 1)} + unsigned{intx::bit_test(u, i - 1)};
+        if (idx != 0)
+            nz = sp1_secp256k1_add_nz(r, points[idx]);
+    }
+    // If r becomes zero                                                             
+    for (; i != 0; --i)
+    {
+        if (!is_zero(r))
+            syscall_secp256k1_double(r);
+        const auto idx =
+            2 * unsigned{intx::bit_test(v, i - 1)} + unsigned{intx::bit_test(u, i - 1)};
+        if (idx != 0)
+            sp1_secp256k1_add(r, points[idx]);
     }
 }
+
 }  // namespace
 #endif
 
@@ -410,14 +471,9 @@ std::optional<evmc::address> ecrecover(std::span<const uint8_t, 32> hash,
     sp1_AffinePoint sp1_R;
     sp1_point_from_bytes(sp1_R, sp1_Rbytes);
 
-    sp1_AffinePoint sp1_T1;
-    sp1_mul(sp1_T1, sp1_G, u1);
-    sp1_AffinePoint sp1_T2;
-    sp1_mul(sp1_T2, sp1_R, u2);
-
+    // Shamir's trick: compute u1*G + u2*R in a single pass
     sp1_AffinePoint sp1_Q;
-    std::copy_n(sp1_T1, SP1_POINT_SIZE, sp1_Q);
-    sp1_secp256k1_add(sp1_Q, sp1_T2);
+    sp1_msm(sp1_Q, u1, sp1_G, u2, sp1_R);
 
     if (is_zero(sp1_Q)) [[unlikely]]
         return std::nullopt;
