@@ -9,6 +9,10 @@
 #include <sp1_syscalls.hpp>
 #endif
 
+#ifdef ZISK
+#include <zisk_syscalls.hpp>
+#endif
+
 
 namespace evmmax::bn254
 {
@@ -17,6 +21,38 @@ struct Fq2Config;
 
 namespace evmmax::ecc
 {
+#ifdef ZISK
+// ZisK BN254 Fp2 (complex extension) precompiles.  Each operand is a pointer to
+// a SyscallComplex256 { x: [u64;4], y: [u64;4] } (real coefficient first), and
+// the result is written in place into the first operand — matching the layout of
+// evmone's Fq2 coeffs array (coeffs[0]=real, coeffs[1]=imag) in canonical form.
+// See ziskos syscalls/bn254_complex_{add,sub,mul}.rs.
+namespace zisk_detail
+{
+struct ZiskFp2Params
+{
+    uint64_t* f1;
+    const uint64_t* f2;
+};
+
+[[gnu::always_inline]] inline void bn254_fp2_addmod(uint64_t* f1, const uint64_t* f2) noexcept
+{
+    ZiskFp2Params p{f1, f2};
+    ZISK_SYSCALL(0x808, &p);  // ZISK_SC_BN254_FP2_ADD
+}
+[[gnu::always_inline]] inline void bn254_fp2_submod(uint64_t* f1, const uint64_t* f2) noexcept
+{
+    ZiskFp2Params p{f1, f2};
+    ZISK_SYSCALL(0x809, &p);  // ZISK_SC_BN254_FP2_SUB
+}
+[[gnu::always_inline]] inline void bn254_fp2_mulmod(uint64_t* f1, const uint64_t* f2) noexcept
+{
+    ZiskFp2Params p{f1, f2};
+    ZISK_SYSCALL(0x80A, &p);  // ZISK_SC_BN254_FP2_MUL
+}
+}  // namespace zisk_detail
+#endif
+
 /// Implements extension field over the base field or other extension fields.
 /// It is a template struct which can be reused for different pairing implementations.
 template <typename ConfigT>
@@ -65,6 +101,15 @@ struct ExtFieldElem
             return res;
         }
 #endif
+#if defined(ZISK)
+        if constexpr (std::is_same_v<ConfigT, bn254::Fq2Config>)
+        {
+            auto res = e1;
+            zisk_detail::bn254_fp2_addmod(reinterpret_cast<uint64_t*>(res.coeffs.data()),
+                reinterpret_cast<const uint64_t*>(e2.coeffs.data()));
+            return res;
+        }
+#endif
 
         auto res = e1.coeffs;
         for (size_t i = 0; i < DEGREE; ++i)
@@ -80,6 +125,15 @@ struct ExtFieldElem
             auto res = e1;
             syscall_bn254_fp2_submod(reinterpret_cast<size_t*>(res.coeffs.data()),
                 reinterpret_cast<const size_t*>(e2.coeffs.data()));
+            return res;
+        }
+#endif
+#if defined(ZISK)
+        if constexpr (std::is_same_v<ConfigT, bn254::Fq2Config>)
+        {
+            auto res = e1;
+            zisk_detail::bn254_fp2_submod(reinterpret_cast<uint64_t*>(res.coeffs.data()),
+                reinterpret_cast<const uint64_t*>(e2.coeffs.data()));
             return res;
         }
 #endif
@@ -101,6 +155,15 @@ struct ExtFieldElem
             return res;
         }
 #endif
+#if defined(ZISK)
+        if constexpr (std::is_same_v<ConfigT, bn254::Fq2Config>)
+        {
+            ExtFieldElem res = {};  // 0 - e == -e
+            zisk_detail::bn254_fp2_submod(reinterpret_cast<uint64_t*>(res.coeffs.data()),
+                reinterpret_cast<const uint64_t*>(e.coeffs.data()));
+            return res;
+        }
+#endif
 
         CoeffArrT ret;
         for (size_t i = 0; i < DEGREE; ++i)
@@ -116,6 +179,15 @@ struct ExtFieldElem
             auto res = e1;
             syscall_bn254_fp2_mulmod(reinterpret_cast<size_t*>(res.coeffs.data()),
                 reinterpret_cast<const size_t*>(e2.coeffs.data()));
+            return res;
+        }
+#endif
+#if defined(ZISK)
+        if constexpr (std::is_same_v<ConfigT, bn254::Fq2Config>)
+        {
+            auto res = e1;
+            zisk_detail::bn254_fp2_mulmod(reinterpret_cast<uint64_t*>(res.coeffs.data()),
+                reinterpret_cast<const uint64_t*>(e2.coeffs.data()));
             return res;
         }
 #endif

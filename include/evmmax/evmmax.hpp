@@ -10,6 +10,10 @@
 #include <sp1_syscalls.hpp>
 #endif
 
+#ifdef ZISK
+#include <zisk_syscalls.hpp>
+#endif
+
 namespace evmmax
 {
 /// Compute the modular inverse of the number modulo 2³²: inv⋅a = 1 mod 2³².
@@ -86,7 +90,7 @@ class ModArith
 public:
     constexpr explicit ModArith(const UintT& mod) noexcept
       : mod_{mod},
-#if defined SP1 || defined SP1TURBO
+#if defined SP1 || defined SP1TURBO || defined ZISK
         r_squared_{BN ? 1 : compute_r_squared(mod)},
         mod_inv_{BN ? 0 : compute_mont_mod_inv(mod)}
 #else
@@ -104,7 +108,7 @@ public:
     /// what gives aR²R⁻¹ % mod = aR % mod.
     constexpr UintT to_mont(const UintT& x) const noexcept
     {
-#if defined SP1 || defined SP1TURBO
+#if defined SP1 || defined SP1TURBO || defined ZISK
         if constexpr (BN)
             return x;
         else
@@ -118,7 +122,7 @@ public:
     /// Montgomery multiplication mul(x, 1) what gives aRR⁻¹ % mod = a % mod.
     constexpr UintT from_mont(const UintT& x) const noexcept
     {
-#if defined SP1 || defined SP1TURBO
+#if defined SP1 || defined SP1TURBO || defined ZISK
         if constexpr (BN)
             return x;
         else
@@ -139,6 +143,30 @@ public:
             UintT res = x;
             syscall_bn254_fp_mulmod(
                 reinterpret_cast<size_t*>(&res), reinterpret_cast<const size_t*>(&y));
+            return res;
+        }
+#endif
+
+#if defined(ZISK)
+        // ZisK has no dedicated BN254 base-field modmul; use the generic 256-bit
+        // modular arithmetic precompile ARITH256_MOD (CSR 0x802), which computes
+        // d = (a*b + c) mod module on canonical (non-Montgomery) values — exactly
+        // what the BN-accelerated path needs.  See ziskos syscalls/arith256_mod.rs.
+        if constexpr (BN)
+        {
+            UintT res;
+            const UintT c0{};
+            struct
+            {
+                const uint64_t* a;
+                const uint64_t* b;
+                const uint64_t* c;
+                const uint64_t* module;
+                uint64_t* d;
+            } params{reinterpret_cast<const uint64_t*>(&x), reinterpret_cast<const uint64_t*>(&y),
+                reinterpret_cast<const uint64_t*>(&c0), reinterpret_cast<const uint64_t*>(&mod_),
+                reinterpret_cast<uint64_t*>(&res)};
+            ZISK_SYSCALL(0x802, &params);
             return res;
         }
 #endif

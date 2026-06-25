@@ -8,6 +8,11 @@
 #include <sp1_syscalls.hpp>
 #endif
 
+#ifdef ZISK
+#include <zisk_syscalls.hpp>
+#include <algorithm>
+#endif
+
 namespace evmmax::secp256k1
 {
 namespace
@@ -379,6 +384,170 @@ void sp1_msm(sp1_AffinePoint r, const uint256& u, const sp1_AffinePoint p,
 #endif
 
 
+#ifdef ZISK
+namespace
+{
+// ZisK secp256k1 affine point: x[4] || y[4], little-endian 64-bit limbs in
+// regular (non-Montgomery) form.  This matches ziskos `SyscallPoint256`
+// (`{ x: [u64;4], y: [u64;4] }`) and is byte-identical to a pair of LE
+// intx::uint256 values, so x/y can be reinterpret_cast<const uint256&>.
+using zisk_AffinePoint = uint64_t[8];
+constexpr size_t ZISK_POINT_LIMBS = 8;
+
+constexpr auto zisk_Gx = 0x79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798_u256;
+constexpr auto zisk_Gy = 0x483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8_u256;
+
+// Generator G in regular-form LE limbs.
+constexpr zisk_AffinePoint zisk_G = {
+    zisk_Gx[0], zisk_Gx[1], zisk_Gx[2], zisk_Gx[3],
+    zisk_Gy[0], zisk_Gy[1], zisk_Gy[2], zisk_Gy[3],
+};
+
+[[gnu::always_inline]] inline bool zisk_is_zero(const zisk_AffinePoint p) noexcept
+{
+    uint64_t fold = 0;
+    for (size_t i = 0; i < ZISK_POINT_LIMBS; ++i)
+        fold |= p[i];
+    return fold == 0;
+}
+
+// Convert a 64-byte big-endian uncompressed point (x||y) to LE limbs.
+inline void zisk_point_from_bytes(zisk_AffinePoint r, const uint8_t bytes[64]) noexcept
+{
+    for (size_t i = 0; i < 4; ++i)
+        r[i] = intx::be::unsafe::load<uint64_t>(&bytes[24 - i * 8]);
+    for (size_t i = 0; i < 4; ++i)
+        r[i + 4] = intx::be::unsafe::load<uint64_t>(&bytes[56 - i * 8]);
+}
+
+inline void zisk_point_to_bytes(uint8_t bytes[64], const zisk_AffinePoint r) noexcept
+{
+    for (size_t i = 0; i < 4; ++i)
+        intx::be::unsafe::store<uint64_t>(&bytes[24 - i * 8], r[i]);
+    for (size_t i = 0; i < 4; ++i)
+        intx::be::unsafe::store<uint64_t>(&bytes[56 - i * 8], r[i + 4]);
+}
+
+// ZisK secp256k1 point-add precompile (CSR 0x803).  Operand is a pointer to
+// { p1: &mut Point256, p2: &Point256 }; the result is written back into p1.
+struct ZiskSecp256k1AddParams
+{
+    uint64_t* p1;
+    const uint64_t* p2;
+};
+
+[[gnu::always_inline]] inline void zisk_secp256k1_add_raw(
+    zisk_AffinePoint r, const zisk_AffinePoint p) noexcept
+{
+    ZiskSecp256k1AddParams params{r, p};
+    ZISK_SYSCALL(0x803, &params);  // ZISK_SC_SECP256K1_ADD
+}
+
+// ZisK secp256k1 point-double precompile (CSR 0x804).  Operand is a pointer
+// directly to the Point256, doubled in place.
+[[gnu::always_inline]] inline void zisk_secp256k1_double_raw(zisk_AffinePoint r) noexcept
+{
+    ZISK_SYSCALL(0x804, r);  // ZISK_SC_SECP256K1_DBL
+}
+
+// Add non-zero p to non-zero r, handling the same-x edge cases the raw
+// precompile does not (mirrors sp1_secp256k1_add_nz).
+[[gnu::always_inline]] inline bool zisk_secp256k1_add_nz(
+    zisk_AffinePoint r, const zisk_AffinePoint p) noexcept
+{
+    // Quick reject on first limb of x (~1/2^64 false positive).
+    if (r[0] != p[0]) [[likely]]
+    {
+        zisk_secp256k1_add_raw(r, p);
+        return true;
+    }
+    if (reinterpret_cast<const uint256&>(r[0]) != reinterpret_cast<const uint256&>(p[0]))
+        [[likely]]
+    {
+        zisk_secp256k1_add_raw(r, p);
+        return true;
+    }
+
+    const auto& ry = reinterpret_cast<const uint256&>(r[ZISK_POINT_LIMBS / 2]);
+    const auto& py = reinterpret_cast<const uint256&>(p[ZISK_POINT_LIMBS / 2]);
+    if (ry == py)
+    {
+        zisk_secp256k1_double_raw(r);
+        return true;
+    }
+    // r == -p  ->  r becomes the point at infinity (all-zero sentinel).
+    std::fill_n(r, ZISK_POINT_LIMBS, uint64_t{0});
+    return false;
+}
+
+// Add p to r, additionally handling zero (infinity) points.
+void zisk_secp256k1_add(zisk_AffinePoint r, const zisk_AffinePoint p) noexcept
+{
+    if (zisk_is_zero(p)) [[unlikely]]
+        return;
+    if (zisk_is_zero(r)) [[unlikely]]
+    {
+        std::copy_n(p, ZISK_POINT_LIMBS, r);
+        return;
+    }
+    zisk_secp256k1_add_nz(r, p);
+}
+
+// ZisK version of ecc::msm(): computes u×P + v×Q via Shamir's trick using the
+// ZisK CSR point precompiles.  Mirrors sp1_msm exactly.
+void zisk_msm(zisk_AffinePoint r, const uint256& u, const zisk_AffinePoint p,
+    const uint256& v, const zisk_AffinePoint q) noexcept
+{
+    zisk_AffinePoint h;
+    std::copy_n(p, ZISK_POINT_LIMBS, h);
+    zisk_secp256k1_add(h, q);
+
+    const uint64_t* points[4] = {nullptr, p, q, h};
+
+    const auto bw = std::max(intx::bit_width(u), intx::bit_width(v));
+    if (bw == 0)
+    {
+        std::fill_n(r, ZISK_POINT_LIMBS, uint64_t{0});
+        return;
+    }
+
+    size_t i = bw;
+    for (; i != 0; --i)
+    {
+        const auto idx =
+            2 * unsigned{intx::bit_test(v, i - 1)} + unsigned{intx::bit_test(u, i - 1)};
+        if (idx != 0)
+        {
+            std::copy_n(points[idx], ZISK_POINT_LIMBS, r);
+            --i;
+            break;
+        }
+    }
+
+    bool nz = true;
+    for (; i != 0 && nz; --i)
+    {
+        zisk_secp256k1_double_raw(r);
+        const auto idx =
+            2 * unsigned{intx::bit_test(v, i - 1)} + unsigned{intx::bit_test(u, i - 1)};
+        if (idx != 0)
+            nz = zisk_secp256k1_add_nz(r, points[idx]);
+    }
+    for (; i != 0; --i)
+    {
+        if (!zisk_is_zero(r))
+            zisk_secp256k1_double_raw(r);
+        const auto idx =
+            2 * unsigned{intx::bit_test(v, i - 1)} + unsigned{intx::bit_test(u, i - 1)};
+        if (idx != 0)
+            zisk_secp256k1_add(r, points[idx]);
+    }
+}
+
+}  // namespace
+#endif
+
+
 std::optional<AffinePoint> secp256k1_ecdsa_recover(std::span<const uint8_t, 32> hash,
     std::span<const uint8_t, 32> r_bytes, std::span<const uint8_t, 32> s_bytes,
     bool parity) noexcept
@@ -480,6 +649,49 @@ std::optional<evmc::address> ecrecover(std::span<const uint8_t, 32> hash,
 
     uint8_t serialized[64];
     sp1_point_to_bytes(serialized, sp1_Q);
+    return to_address(serialized);
+#elif defined(ZISK)
+    // Validate r and s.
+    const auto opt_r = Curve::Fr::from_bytes(r_bytes);
+    if (!opt_r.has_value() || *opt_r == 0)
+        return std::nullopt;
+    const auto opt_s = Curve::Fr::from_bytes(s_bytes);
+    if (!opt_s.has_value() || *opt_s == 0)
+        return std::nullopt;
+    const auto& r_fr = *opt_r;
+    const auto& s_fr = *opt_s;
+
+    // Compute z, u1, u2 (regular form) using FieldElement arithmetic.
+    const auto z = Curve::Fr{intx::be::unsafe::load<uint256>(hash.data())};
+    const auto r_inv = 1 / r_fr;
+    const auto u1 = (-z * r_inv).value();
+    const auto u2 = (s_fr * r_inv).value();
+    assert(u2 != 0);
+
+    // Decompress R using the (software, well-tested) field square root, then
+    // hand the regular-form affine point to the ZisK CSR point precompiles.
+    // field_sqrt runs once per recovery; the dominant cost is the msm below,
+    // whose EC group operations are accelerated via CSR add/double.
+    const auto r_mont = Curve::Fp{r_fr.value()};
+    const auto y = calculate_y(r_mont, parity);
+    if (!y.has_value())
+        return std::nullopt;
+    const auto R = AffinePoint{r_mont, *y};
+
+    uint8_t r_bytes_be[64];
+    R.to_bytes(r_bytes_be);  // regular big-endian x||y
+    zisk_AffinePoint zisk_R;
+    zisk_point_from_bytes(zisk_R, r_bytes_be);
+
+    // Shamir's trick: Q = u1*G + u2*R.
+    zisk_AffinePoint zisk_Q;
+    zisk_msm(zisk_Q, u1, zisk_G, u2, zisk_R);
+
+    if (zisk_is_zero(zisk_Q)) [[unlikely]]
+        return std::nullopt;
+
+    uint8_t serialized[64];
+    zisk_point_to_bytes(serialized, zisk_Q);
     return to_address(serialized);
 #else
     const auto pubkey = secp256k1_ecdsa_recover(hash, r_bytes, s_bytes, parity);
