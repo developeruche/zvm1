@@ -19,6 +19,10 @@
 #include <sp1_syscalls.hpp>
 #endif
 
+#ifdef ZISK
+#include <zisk_syscalls.hpp>
+#endif
+
 
 #if defined(__x86_64__)  // NOLINT(readability-use-concise-preprocessor-directives)
 
@@ -194,6 +198,27 @@ static bool calc_chunk(uint8_t chunk[CHUNK_SIZE], struct BufferState* state)
         syscall_sha256_compress(w, h_sp1);
         for (j = 0; j < 8; j++)
             h[j] = static_cast<uint32_t>(h_sp1[j]);
+#elif defined(ZISK)
+        // ZisK SHA-256F precompile (CSR port 0x805).  The precompile compresses
+        // a single 512-bit block into the running hash state in place.  Its ABI
+        // (ziskos syscalls/sha256f.rs) is a pointer to:
+        //
+        //     struct SyscallSha256Params { state: &mut [u64;4]; input: &[u64;8]; }
+        //
+        // where `state` is reinterpreted as [u32;8] (the eight hash words, native
+        // order) and `input` is reinterpreted as a raw 64-byte message block.
+        // evmone's software variables map onto this exactly: `h` is uint32_t[8]
+        // (32 bytes) and `chunk` is uint8_t[64], so no repacking is required.
+        struct
+        {
+            uint32_t* state;
+            const uint8_t* input;
+        } zisk_sha_params{h, chunk};
+        // CSR port 0x805 == ZISK_SC_SHA256F.  The ZISK_SYSCALL macro stringizes
+        // its first argument into the instruction, so it must be a numeric
+        // literal rather than the constexpr name.
+        ZISK_SYSCALL(0x805, &zisk_sha_params);
+        (void)p;  // unused on the accelerated path
 #else
 
         uint32_t ah[8];

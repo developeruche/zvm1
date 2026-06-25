@@ -14,6 +14,24 @@ static inline __attribute__((always_inline)) void syscall_keccak_permute(uint64_
     register uint64_t a1 asm("a1") = 0;
     asm volatile("ecall" : "+r"(t0) : "r"(a0), "r"(a1) : "memory");
 }
+#elif defined(ZISK)
+// ZisK Keccak-f[1600] precompile (CSR port 0x800).  The precompile reads and
+// writes the 25-word state in place; the operand pointer is passed in a0 and
+// the CSR write (`csrs`) triggers the precompile.  See ziskos
+// syscalls/keccakf.rs and definitions/src/syscall.rs.
+static inline __attribute__((always_inline)) void syscall_keccak_permute(uint64_t state[25])
+{
+    register uint64_t* a0 asm("a0") = state;
+    // The base rv64ima march does not include the Zicsr extension; enable it
+    // locally for this `csrs` so the assembler accepts the CSR write.
+    asm volatile(".option push\n\t"
+                 ".option arch, +zicsr\n\t"
+                 "csrs 0x800, %0\n\t"
+                 ".option pop"
+                 :
+                 : "r"(a0)
+                 : "memory");
+}
 #endif
 
 // Provide __has_attribute macro if not defined.
@@ -305,7 +323,7 @@ static void keccakf1600_generic(uint64_t state[25])
 
 /// The pointer to the best Keccak-f[1600] function implementation,
 /// selected during runtime initialization.
-#if defined(SP1TURBO) || defined(SP1)
+#if defined(SP1TURBO) || defined(SP1) || defined(ZISK)
 #define DEFAULT_keccakf1600 syscall_keccak_permute
 #else
 #define DEFAULT_keccakf1600 keccakf1600_generic
