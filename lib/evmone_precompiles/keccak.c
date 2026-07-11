@@ -32,6 +32,19 @@ static inline __attribute__((always_inline)) void syscall_keccak_permute(uint64_
                  : "r"(a0)
                  : "memory");
 }
+#elif defined(OPENVM)
+// OpenVM Keccak-f[1600] precompile (R-type: opcode=0x0b, funct3=0b100,
+// funct7=0).  Operates in place on the 200-byte (25 x uint64_t) state
+// buffer, matching this function's existing native uint64_t[25] layout —
+// no repacking needed.  Encoding verified against
+// extensions/keccak256/guest/src/lib.rs (native_keccakf) at pinned tag
+// v2.0.0-rc.3.  Inlined directly (rather than via openvm_syscalls.hpp,
+// which is a C++ header) since this translation unit is compiled as C.
+static inline __attribute__((always_inline)) void syscall_keccak_permute(uint64_t state[25])
+{
+    void* buffer = state;
+    asm volatile(".insn r 0x0b, 0b100, 0, %0, x0, x0" : "+r"(buffer) :: "memory");
+}
 #endif
 
 // Provide __has_attribute macro if not defined.
@@ -323,7 +336,7 @@ static void keccakf1600_generic(uint64_t state[25])
 
 /// The pointer to the best Keccak-f[1600] function implementation,
 /// selected during runtime initialization.
-#if defined(SP1TURBO) || defined(SP1) || defined(ZISK)
+#if defined(SP1TURBO) || defined(SP1) || defined(ZISK) || defined(OPENVM)
 #define DEFAULT_keccakf1600 syscall_keccak_permute
 #else
 #define DEFAULT_keccakf1600 keccakf1600_generic

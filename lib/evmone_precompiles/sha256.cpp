@@ -23,6 +23,10 @@
 #include <zisk_syscalls.hpp>
 #endif
 
+#ifdef OPENVM
+#include <openvm_syscalls.hpp>
+#endif
+
 
 #if defined(__x86_64__)  // NOLINT(readability-use-concise-preprocessor-directives)
 
@@ -251,6 +255,19 @@ static bool calc_chunk(uint8_t chunk[CHUNK_SIZE], struct BufferState* state)
 
             for (j = 0; j < 8; ++j)
                 h[j] = __builtin_bswap32(out_state[j]);
+        }
+        (void)p;  // unused on the accelerated path
+#elif defined(OPENVM)
+        // OpenVM SHA-256 compression precompile — single-shot over the raw
+        // 64-byte block, no separate message-schedule "extend" step needed
+        // (see openvm_syscalls.hpp::sha256_compress). `h` is already in the
+        // native-order uint32_t[8] layout the precompile expects, and `chunk`
+        // is already the raw big-endian message block — no repacking needed.
+        {
+            uint32_t out_state[8];
+            openvm::sha256_compress(h, chunk, out_state);
+            for (j = 0; j < 8; ++j)
+                h[j] = out_state[j];
         }
         (void)p;  // unused on the accelerated path
 #else
