@@ -49,8 +49,8 @@ constexpr auto storage_cost_spec = []() noexcept {
 
 struct StorageStoreCost
 {
-    int16_t gas_cost;
-    int16_t gas_refund;
+    int32_t gas_cost;  // int32: Amsterdam entries carry state gas (>32767).
+    int32_t gas_refund;
 };
 
 // The lookup table of SSTORE costs by the storage update status.
@@ -91,6 +91,31 @@ constexpr auto sstore_costs = []() noexcept {
         }
     }
 
+    // Amsterdam (EIP-2780/8037/8038): STORAGE_WRITE 10000 on the first
+    // change of a slot in the transaction; STORAGE_SET state gas 97920 when
+    // that first change creates the slot (0 -> X), credited back immediately
+    // when the slot is cleared again (0 -> X -> 0); storage-clear refund
+    // (10000 + 3000) * 4800 / 5000 = 12480; write refunded when the slot is
+    // restored to its original value. Warm access 100 is the baseline of
+    // every entry; the cold extra is charged separately.
+    {
+        constexpr int32_t WARM = 100;
+        constexpr int32_t WRITE = 10000;
+        constexpr int32_t SET_STATE = 97920;
+        constexpr int32_t CLEAR_REFUND = 12480;
+        auto& e = tbl[EVMC_AMSTERDAM];
+        e[EVMC_STORAGE_ASSIGNED] = {WARM, 0};
+        e[EVMC_STORAGE_ADDED] = {WARM + WRITE + SET_STATE, 0};
+        e[EVMC_STORAGE_DELETED] = {WARM + WRITE, CLEAR_REFUND};
+        e[EVMC_STORAGE_MODIFIED] = {WARM + WRITE, 0};
+        e[EVMC_STORAGE_DELETED_ADDED] = {WARM, -CLEAR_REFUND};
+        e[EVMC_STORAGE_MODIFIED_DELETED] = {WARM, CLEAR_REFUND};
+        e[EVMC_STORAGE_DELETED_RESTORED] = {WARM, -CLEAR_REFUND + WRITE};
+        e[EVMC_STORAGE_ADDED_DELETED] = {WARM - SET_STATE, WRITE};
+        e[EVMC_STORAGE_MODIFIED_RESTORED] = {WARM, WRITE};
+        tbl[EVMC_EXPERIMENTAL] = tbl[EVMC_AMSTERDAM];
+    }
+
     return tbl;
 }();
 }  // namespace
@@ -105,8 +130,8 @@ Result sload(StackTop stack, int64_t gas_left, ExecutionState& state) noexcept
     {
         // The warm storage access cost is already applied (from the cost table).
         // Here we need to apply additional cold storage access cost.
-        constexpr auto additional_cold_sload_cost =
-            instr::cold_sload_cost - instr::warm_storage_read_cost;
+        const auto additional_cold_sload_cost =
+            instr::cold_sload_cost_rev(state.rev) - instr::warm_storage_read_cost;
         if ((gas_left -= additional_cold_sload_cost) < 0)
             return {EVMC_OUT_OF_GAS, gas_left};
     }
@@ -127,10 +152,16 @@ Result sstore(StackTop stack, int64_t gas_left, ExecutionState& state) noexcept
     const auto key = intx::be::store<evmc::bytes32>(stack.pop());
     const auto value = intx::be::store<evmc::bytes32>(stack.pop());
 
+    // Pre-Amsterdam the cold surcharge is the full cold-sload cost (the
+    // net-cost table entries don't include the warm access for writes);
+    // the Amsterdam entries bake the warm access into every entry, so only
+    // the additional cold cost (3000 - 100) is charged here.
     const auto gas_cost_cold =
         (state.rev >= EVMC_BERLIN &&
             state.host.access_storage(state.msg->recipient, key) == EVMC_ACCESS_COLD) ?
-            instr::cold_sload_cost :
+            (state.rev >= EVMC_AMSTERDAM ?
+                    instr::amsterdam_cold_access_cost - instr::warm_storage_read_cost :
+                    int64_t{instr::cold_sload_cost}) :
             0;
     const auto status = state.host.set_storage(state.msg->recipient, key, value);
 

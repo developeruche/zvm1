@@ -206,6 +206,17 @@ StateDiff State::build_diff(evmc_revision rev) const
     {
         if (m.destructed)
         {
+            // Amsterdam (EIP-8246): selfdestruct clears code/nonce/storage
+            // but preserves the balance (relevant when the beneficiary is
+            // the destructed account itself). Report a modified entry with
+            // empty code — the code change wipes the storage downstream.
+            if (rev >= EVMC_AMSTERDAM && m.balance != 0)
+            {
+                auto& e = diff.modified_accounts.emplace_back(
+                    StateDiff::Entry{addr, 0, m.balance});
+                e.code = bytes{};
+                continue;
+            }
             // TODO: This must be done even for just_created
             //   because destructed may pre-date just_created. Add test to evmone (EEST has it).
             diff.deleted_accounts.emplace_back(addr);
@@ -567,8 +578,13 @@ TransactionReceipt transition(const StateView& state_view, const BlockInfo& bloc
     assert(sender_acc.nonce < Account::NonceMax);  // Required for valid tx.
     ++sender_acc.nonce;                            // Bump sender nonce.
 
+    // Amsterdam applies authorizations below (state-dependent costs must be
+    // charged against the execution gas); earlier revisions keep the flat
+    // intrinsic pricing with the existing-authority refund.
     const auto delegation_refund =
-        process_authorization_list(state, tx.chain_id, tx.authorization_list);
+        rev >= EVMC_AMSTERDAM ?
+            0 :
+            process_authorization_list(state, tx.chain_id, tx.authorization_list);
 
     const auto base_fee = (rev >= EVMC_LONDON) ? block.base_fee : 0;
     assert(tx.max_gas_price >= base_fee);                   // Required for valid tx.
@@ -611,6 +627,121 @@ TransactionReceipt transition(const StateView& state_view, const BlockInfo& bloc
         host.access_account(block.coinbase);
 
     auto message = build_message(tx, tx_props.execution_gas_limit);
+
+    // Amsterdam top-frame preparation: apply authorizations (EIP-7702, with
+    // the Amsterdam cost decomposition) and charge the state-dependent
+    // dispatch costs (EELS set_delegation + prepare_dispatch). All charges
+    // draw from the execution gas (state gas spills into regular gas in
+    // this Stage-1 model); running out here consumes all execution gas and
+    // fails the transaction without dispatching.
+    bool prep_out_of_gas = false;
+    if (rev >= EVMC_AMSTERDAM)
+    {
+        int64_t prep_gas = 0;      // regular
+        int64_t prep_state_gas = 0;  // state (tallied separately)
+
+        if (!tx.authorization_list.empty())
+        {
+            // Accounts whose write the transaction has already priced.
+            std::vector<address> written{tx.sender};
+            if (tx.to.has_value() && tx.value != 0)
+                written.push_back(*tx.to);
+            std::vector<address> delegation_set_for;
+
+            for (const auto& auth : tx.authorization_list)
+            {
+                if (auth.chain_id != 0 && auth.chain_id != tx.chain_id)
+                    continue;
+                if (auth.nonce == Account::NonceMax)
+                    continue;
+                if (auth.v > 1)
+                    continue;
+                if (!auth.signer.has_value())
+                    continue;
+                if (auth.s > SECP256K1N_OVER_2)
+                    continue;
+
+                const auto& authority_addr = *auth.signer;
+                auto& authority = state.get_or_insert(authority_addr, {.erase_if_empty = true});
+                authority.access_status = EVMC_ACCESS_WARM;
+
+                if (authority.code_hash != Account::EMPTY_CODE_HASH &&
+                    !is_code_delegated(state.get_code(authority_addr)))
+                    continue;
+                if (auth.nonce != authority.nonce)
+                    continue;
+
+                // NEW_ACCOUNT state gas when the authority leaf does not
+                // exist ("empty" implies non-existent, EIP-7523).
+                if (authority.is_empty())
+                    prep_state_gas += 183600;
+
+                if (std::ranges::find(written, authority_addr) == written.end())
+                {
+                    prep_gas += 8000;  // ACCOUNT_WRITE
+                    written.push_back(authority_addr);
+                }
+
+                const bool delegated_before =
+                    is_code_delegated(state_view.get_account_code(authority_addr));
+
+                if (is_zero(auth.addr))
+                {
+                    if (authority.code_hash != Account::EMPTY_CODE_HASH)
+                    {
+                        authority.code_changed = true;
+                        authority.code.clear();
+                        authority.code_hash = Account::EMPTY_CODE_HASH;
+                    }
+                }
+                else
+                {
+                    if (!delegated_before &&
+                        std::ranges::find(delegation_set_for, authority_addr) ==
+                            delegation_set_for.end())
+                        prep_state_gas += 35190;  // AUTH_BASE state gas
+                    delegation_set_for.push_back(authority_addr);
+
+                    auto new_code = bytes(DELEGATION_MAGIC) + bytes(auth.addr);
+                    if (authority.code != new_code)
+                    {
+                        authority.code_changed = true;
+                        authority.code = std::move(new_code);
+                        authority.code_hash = keccak256(authority.code);
+                    }
+                }
+                ++authority.nonce;
+            }
+        }
+
+        // prepare_dispatch: NEW_ACCOUNT state gas for a value transfer to a
+        // recipient that is not alive. (The create-target charge is applied
+        // inside Host::create — identical amount, single charge site. The
+        // Host::execute_message tally is skipped for the top frame because
+        // it is accounted here, before the frame runs.)
+        bool top_call_creates_account = false;
+        if (tx.to.has_value() && tx.value != 0)
+        {
+            const auto* to_acc = state.find(*tx.to);
+            top_call_creates_account = to_acc == nullptr || to_acc->is_empty();
+            if (top_call_creates_account)
+                prep_state_gas += 183600;
+        }
+
+        const auto total_prep = prep_gas + prep_state_gas;
+        if (message.gas < total_prep)
+            prep_out_of_gas = true;
+        else
+        {
+            message.gas -= total_prep;
+            // Host::execute_message will tally the top-frame value-to-dead
+            // creation again when the transfer happens; compensate so the
+            // charge is tallied exactly once.
+            host.add_state_gas(
+                prep_state_gas - (top_call_creates_account ? 183600 : 0));
+        }
+    }
+
     if (tx.to.has_value())
     {
         if (const auto delegate = get_delegate_address(host, *tx.to))
@@ -621,9 +752,14 @@ TransactionReceipt transition(const StateView& state_view, const BlockInfo& bloc
         }
     }
 
-    const auto result = host.call(message);
+    const auto result = prep_out_of_gas ? evmc::Result{EVMC_OUT_OF_GAS, 0} : host.call(message);
 
-    auto gas_used = tx.gas_limit - result.gas_left;
+    // Amsterdam: the state-gas reservoir (tx gas above the EIP-7825 cap)
+    // is not given to the EVM; unspent it flows back to the sender.
+    const auto reservoir = rev >= EVMC_AMSTERDAM ? tx_props.state_gas_reservoir : 0;
+
+    auto gas_used = tx.gas_limit - reservoir - result.gas_left;
+    const auto gas_used_before_refund = gas_used;
 
     const auto max_refund_quotient = rev >= EVMC_LONDON ? 5 : 2;
     const auto refund_limit = gas_used / max_refund_quotient;
@@ -638,7 +774,14 @@ TransactionReceipt transition(const StateView& state_view, const BlockInfo& bloc
     state.touch(block.coinbase).balance += gas_used * priority_gas_price;
 
     // Cumulative gas used is unknown in this scope.
-    return TransactionReceipt{
-        tx.type, result.status_code, gas_used, {}, host.take_logs(), state.build_diff(rev)};
+    TransactionReceipt receipt;
+    receipt.type = tx.type;
+    receipt.status = result.status_code;
+    receipt.gas_used = gas_used;
+    receipt.gas_used_before_refund = gas_used_before_refund;
+    receipt.state_gas_used = std::max(host.state_gas_used(), int64_t{0});
+    receipt.logs = host.take_logs();
+    receipt.state_diff = state.build_diff(rev);
+    return receipt;
 }
 }  // namespace evmone::state

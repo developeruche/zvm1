@@ -29,8 +29,8 @@ inline std::variant<evmc::address, Result> get_target_address(
 
     const auto delegate_account_access_cost =
         (state.host.access_account(*delegate_addr) == EVMC_ACCESS_COLD ?
-                instr::cold_account_access_cost :
-                instr::warm_storage_read_cost);
+                instr::cold_account_access_cost_rev(state.rev) :
+                int64_t{instr::warm_storage_read_cost});
 
     if ((gas_left -= delegate_account_access_cost) < 0)
         return Result{EVMC_OUT_OF_GAS, gas_left};
@@ -83,7 +83,7 @@ Result call_impl(StackTop stack, int64_t gas_left, ExecutionState& state) noexce
 
     if (state.rev >= EVMC_BERLIN && state.host.access_account(dst) == EVMC_ACCESS_COLD)
     {
-        if ((gas_left -= instr::additional_cold_account_access_cost) < 0)
+        if ((gas_left -= instr::additional_cold_account_access_cost_rev(state.rev)) < 0)
             return {EVMC_OUT_OF_GAS, gas_left};
     }
 
@@ -126,7 +126,11 @@ Result call_impl(StackTop stack, int64_t gas_left, ExecutionState& state) noexce
 
     if constexpr (HAS_VALUE_ARG)
     {
-        auto cost = has_value ? CALL_VALUE_COST : 0;
+        // Amsterdam (EIP-2780): CALL_VALUE = ACCOUNT_WRITE 8000 + stipend
+        // 2300 = 10300.
+        const int64_t call_value_cost =
+            state.rev >= EVMC_AMSTERDAM ? 10300 : CALL_VALUE_COST;
+        auto cost = has_value ? call_value_cost : 0;
 
         if constexpr (Op == OP_CALL)
         {
@@ -134,7 +138,11 @@ Result call_impl(StackTop stack, int64_t gas_left, ExecutionState& state) noexce
                 return {EVMC_STATIC_MODE_VIOLATION, gas_left};
 
             if ((has_value || state.rev < EVMC_SPURIOUS_DRAGON) && !state.host.account_exists(dst))
-                cost += ACCOUNT_CREATION_COST;
+            {
+                // Amsterdam (EIP-8037): NEW_ACCOUNT is 183600 state gas
+                // (charged as spilled regular gas; tallied by the Host).
+                cost += state.rev >= EVMC_AMSTERDAM ? 183600 : ACCOUNT_CREATION_COST;
+            }
         }
 
         if ((gas_left -= cost) < 0)

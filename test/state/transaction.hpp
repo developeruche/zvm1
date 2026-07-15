@@ -90,6 +90,11 @@ struct TransactionProperties
 
     /// The minimal amount of gas the transaction must use.
     int64_t min_gas_cost = 0;
+
+    /// Amsterdam (EIP-8037): the state-gas reservoir — the portion of the
+    /// transaction gas limit above the EIP-7825 regular-gas cap. Not given
+    /// to the EVM as execution gas; settled by the caller.
+    int64_t state_gas_reservoir = 0;
 };
 
 struct Log
@@ -118,6 +123,13 @@ struct TransactionReceipt
 
     /// Amount of gas used by this and previous transactions in the block.
     int64_t cumulative_gas_used = 0;
+
+    /// Amsterdam: gas used before the refund and calldata-floor adjustments
+    /// (regular + state dimensions combined), for EIP-7778 block accounting.
+    int64_t gas_used_before_refund = 0;
+
+    /// Amsterdam (EIP-8037/8038): state gas consumed by this transaction.
+    int64_t state_gas_used = 0;
     std::vector<Log> logs;
     // BloomFilter logs_bloom_filter;
     StateDiff state_diff;

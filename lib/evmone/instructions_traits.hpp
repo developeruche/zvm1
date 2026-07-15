@@ -25,6 +25,28 @@ inline constexpr auto warm_storage_read_cost = 100;
 /// If the access turns out to be cold, this cost must be applied additionally.
 inline constexpr auto additional_cold_account_access_cost =
     cold_account_access_cost - warm_storage_read_cost;
+
+/// Amsterdam (EIP-8038) repriced cold access costs.
+inline constexpr auto amsterdam_cold_access_cost = 3000;
+
+/// Revision-aware cold sload cost (EIP-8038 reprices to 3000 in Amsterdam).
+inline constexpr int64_t cold_sload_cost_rev(evmc_revision rev) noexcept
+{
+    return rev >= EVMC_AMSTERDAM ? amsterdam_cold_access_cost : cold_sload_cost;
+}
+
+/// Revision-aware cold account access cost.
+inline constexpr int64_t cold_account_access_cost_rev(evmc_revision rev) noexcept
+{
+    return rev >= EVMC_AMSTERDAM ? amsterdam_cold_access_cost : cold_account_access_cost;
+}
+
+/// Revision-aware additional (on top of the warm cost from the gas table)
+/// cold account access cost.
+inline constexpr int64_t additional_cold_account_access_cost_rev(evmc_revision rev) noexcept
+{
+    return cold_account_access_cost_rev(rev) - warm_storage_read_cost;
+}
 /// @}
 
 
@@ -180,6 +202,11 @@ constexpr inline GasCostTable gas_costs = []() noexcept {
     table[EVMC_AMSTERDAM][OP_DUPN] = 3;
     table[EVMC_AMSTERDAM][OP_SWAPN] = 3;
     table[EVMC_AMSTERDAM][OP_EXCHANGE] = 3;
+    // EIP-2780/8037: CREATE* static cost becomes CREATE_ACCESS
+    // (ACCOUNT_WRITE 8000 + COLD_STORAGE_ACCESS 3000); account-creation
+    // state gas is charged dynamically.
+    table[EVMC_AMSTERDAM][OP_CREATE] = 11000;
+    table[EVMC_AMSTERDAM][OP_CREATE2] = 11000;
 
     table[EVMC_EXPERIMENTAL] = table[EVMC_AMSTERDAM];
 

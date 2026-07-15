@@ -479,7 +479,7 @@ inline Result balance(StackTop stack, int64_t gas_left, ExecutionState& state) n
 
     if (state.rev >= EVMC_BERLIN && state.host.access_account(addr) == EVMC_ACCESS_COLD)
     {
-        if ((gas_left -= instr::additional_cold_account_access_cost) < 0)
+        if ((gas_left -= instr::additional_cold_account_access_cost_rev(state.rev)) < 0)
             return {EVMC_OUT_OF_GAS, gas_left};
     }
 
@@ -621,7 +621,7 @@ inline Result extcodesize(StackTop stack, int64_t gas_left, ExecutionState& stat
 
     if (state.rev >= EVMC_BERLIN && state.host.access_account(addr) == EVMC_ACCESS_COLD)
     {
-        if ((gas_left -= instr::additional_cold_account_access_cost) < 0)
+        if ((gas_left -= instr::additional_cold_account_access_cost_rev(state.rev)) < 0)
             return {EVMC_OUT_OF_GAS, gas_left};
     }
 
@@ -645,7 +645,7 @@ inline Result extcodecopy(StackTop stack, int64_t gas_left, ExecutionState& stat
 
     if (state.rev >= EVMC_BERLIN && state.host.access_account(addr) == EVMC_ACCESS_COLD)
     {
-        if ((gas_left -= instr::additional_cold_account_access_cost) < 0)
+        if ((gas_left -= instr::additional_cold_account_access_cost_rev(state.rev)) < 0)
             return {EVMC_OUT_OF_GAS, gas_left};
     }
 
@@ -702,7 +702,7 @@ inline Result extcodehash(StackTop stack, int64_t gas_left, ExecutionState& stat
 
     if (state.rev >= EVMC_BERLIN && state.host.access_account(addr) == EVMC_ACCESS_COLD)
     {
-        if ((gas_left -= instr::additional_cold_account_access_cost) < 0)
+        if ((gas_left -= instr::additional_cold_account_access_cost_rev(state.rev)) < 0)
             return {EVMC_OUT_OF_GAS, gas_left};
     }
 
@@ -1110,7 +1110,7 @@ inline TermResult selfdestruct(StackTop stack, int64_t gas_left, ExecutionState&
 
     if (state.rev >= EVMC_BERLIN && state.host.access_account(beneficiary) == EVMC_ACCESS_COLD)
     {
-        if ((gas_left -= instr::cold_account_access_cost) < 0)
+        if ((gas_left -= instr::cold_account_access_cost_rev(state.rev)) < 0)
             return {EVMC_OUT_OF_GAS, gas_left};
     }
 
@@ -1122,7 +1122,12 @@ inline TermResult selfdestruct(StackTop stack, int64_t gas_left, ExecutionState&
             // sending value to a non-existing account.
             if (!state.host.account_exists(beneficiary))
             {
-                if ((gas_left -= 25000) < 0)
+                // Amsterdam (EIP-2780/8037): ACCOUNT_WRITE regular gas plus
+                // NEW_ACCOUNT state gas (charged as spilled regular gas and
+                // tallied by the Host's selfdestruct handler).
+                const int64_t new_account_cost =
+                    state.rev >= EVMC_AMSTERDAM ? 8000 + 183600 : 25000;
+                if ((gas_left -= new_account_cost) < 0)
                     return {EVMC_OUT_OF_GAS, gas_left};
             }
         }

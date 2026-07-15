@@ -62,6 +62,16 @@ evmc_storage_status Host::set_storage(
             status = EVMC_STORAGE_MODIFIED_RESTORED;  // X → Y → X
     }
 
+    // Amsterdam (EIP-8037): STORAGE_SET state gas on slot creation,
+    // credited back when the created slot is cleared again.
+    if (m_rev >= EVMC_AMSTERDAM)
+    {
+        if (status == EVMC_STORAGE_ADDED)
+            m_state_gas_used += 97920;
+        else if (status == EVMC_STORAGE_ADDED_DELETED)
+            m_state_gas_used -= 97920;
+    }
+
     // In Berlin this is handled in access_storage().
     if (m_rev < EVMC_BERLIN)
         m_state.journal_storage_change(addr, key, storage_slot);
@@ -130,10 +140,20 @@ bool Host::selfdestruct(const address& addr, const address& beneficiary) noexcep
         m_state.journal_create(beneficiary, false);
     auto& acc = m_state.get(addr);
     const auto balance = acc.balance;
+
+    // Amsterdam (EIP-8037): NEW_ACCOUNT state gas for the beneficiary sweep
+    // (the regular ACCOUNT_WRITE part is charged by the instruction).
+    if (m_rev >= EVMC_AMSTERDAM && balance != 0 && !account_exists(beneficiary))
+        m_state_gas_used += 183600;
+
     auto& beneficiary_acc = m_state.touch(beneficiary);
 
     m_state.journal_balance_change(beneficiary, beneficiary_acc.balance);
     m_state.journal_balance_change(addr, balance);
+
+    // Amsterdam (EIP-7708): the sweep emits a transfer log.
+    if (m_rev >= EVMC_AMSTERDAM && addr != beneficiary)
+        emit_transfer_log(addr, beneficiary, balance);
 
     if (m_rev >= EVMC_CANCUN && !acc.just_created)
     {
@@ -150,8 +170,16 @@ bool Host::selfdestruct(const address& addr, const address& beneficiary) noexcep
 
     // Transfer may happen multiple times per single account as account's balance
     // can be increased with a call following previous selfdestruct.
-    beneficiary_acc.balance += balance;
-    acc.balance = 0;  // Zero balance if acc is the beneficiary.
+    // Amsterdam (EIP-8246): a self-beneficiary keeps its balance (no burn).
+    if (m_rev >= EVMC_AMSTERDAM && addr == beneficiary)
+    {
+        // Balance preserved; deletion below keeps it via build_diff.
+    }
+    else
+    {
+        beneficiary_acc.balance += balance;
+        acc.balance = 0;  // Zero balance if acc is the beneficiary (burn, pre-Amsterdam).
+    }
 
     // Mark the destruction if not done already.
     if (!acc.destructed)
@@ -263,6 +291,15 @@ evmc::Result Host::create(const evmc_message& msg) noexcept
 
     auto* new_acc = m_state.find(msg.recipient);
     const bool new_acc_exists = new_acc != nullptr;
+    // Amsterdam (EIP-8037): NEW_ACCOUNT state gas for a creation target
+    // whose account leaf is not alive. Charged from the create frame's gas
+    // (EELS charges the parent pre-split; the 1/64 retention difference is
+    // a known Stage-1 approximation).
+    int64_t create_state_gas = 0;
+    if (m_rev >= EVMC_AMSTERDAM &&
+        (!new_acc_exists || (new_acc->nonce == 0 && new_acc->balance == 0 &&
+                                new_acc->code_hash == Account::EMPTY_CODE_HASH)))
+        create_state_gas = 183600;
     if (!new_acc_exists)
         new_acc = &m_state.insert(msg.recipient);
     else if (is_create_collision(*new_acc))
@@ -285,13 +322,31 @@ evmc::Result Host::create(const evmc_message& msg) noexcept
     sender_acc.balance -= value;
     new_acc->balance += value;  // The new account may be prefunded.
 
+    // Amsterdam (EIP-7708): value endowment emits a transfer log.
+    if (m_rev >= EVMC_AMSTERDAM && address{msg.sender} != address{msg.recipient})
+        emit_transfer_log(msg.sender, msg.recipient, value);
+
     auto create_msg = msg;
     create_msg.input_data = nullptr;
     create_msg.input_size = 0;
+    if (create_state_gas != 0)
+    {
+        if (create_msg.gas < create_state_gas)
+            return evmc::Result{EVMC_OUT_OF_GAS};
+        create_msg.gas -= create_state_gas;
+        m_state_gas_used += create_state_gas;
+    }
     const bytes_view initcode{msg.input_data, msg.input_size};
     auto result = m_vm.execute(*this, m_rev, create_msg, initcode.data(), initcode.size());
     if (result.status_code != EVMC_SUCCESS)
     {
+        // The failed frame's state rolls back, so its NEW_ACCOUNT state gas
+        // is credited back (EELS credit_state_gas_refund on child error).
+        if (create_state_gas != 0)
+        {
+            result.gas_left += create_state_gas;
+            m_state_gas_used -= create_state_gas;
+        }
         result.create_address = msg.recipient;
         return result;
     }
@@ -301,11 +356,25 @@ evmc::Result Host::create(const evmc_message& msg) noexcept
 
     const bytes_view code{result.output_data, result.output_size};
 
-    if (m_rev >= EVMC_SPURIOUS_DRAGON && code.size() > MAX_CODE_SIZE)
+    // Amsterdam (EIP-7954): max contract size 0x10000.
+    const size_t max_code_size = m_rev >= EVMC_AMSTERDAM ? 0x10000 : MAX_CODE_SIZE;
+    if (m_rev >= EVMC_SPURIOUS_DRAGON && code.size() > max_code_size)
         return evmc::Result{EVMC_FAILURE};
 
-    // Code deployment cost.
-    const auto cost = std::ssize(code) * 200;
+    // Code deployment cost. Amsterdam (EIP-2780/8037): keccak hashing cost
+    // (6/word, regular) plus per-byte state gas (1530/byte) instead of the
+    // flat 200/byte.
+    int64_t cost = 0;
+    if (m_rev >= EVMC_AMSTERDAM)
+    {
+        const auto num_words = (std::ssize(code) + 31) / 32;
+        const auto deposit_state_gas = std::ssize(code) * 1530;
+        cost = num_words * 6 + deposit_state_gas;
+        if (gas_left >= cost)
+            m_state_gas_used += deposit_state_gas;
+    }
+    else
+        cost = std::ssize(code) * 200;
     gas_left -= cost;
     if (gas_left < 0)
     {
@@ -347,6 +416,13 @@ evmc::Result Host::execute_message(const evmc_message& msg) noexcept
             m_state.touch(msg.recipient);
         else
         {
+            // Amsterdam (EIP-8037): tally NEW_ACCOUNT state gas for a value
+            // transfer materializing a dead account. The gas deduction
+            // happens at the CALL instruction (inner frames) or in
+            // transition() (the top frame).
+            if (m_rev >= EVMC_AMSTERDAM && !account_exists(msg.recipient))
+                m_state_gas_used += 183600;
+
             // We skip touching if we send value, because account cannot end up empty.
             // It will either have value, or code that transfers this value out, or will be
             // selfdestructed anyway.
@@ -360,6 +436,10 @@ evmc::Result Host::execute_message(const evmc_message& msg) noexcept
             m_state.journal_balance_change(msg.recipient, dst_acc.balance);
             m_state.get(msg.sender).balance -= value;
             dst_acc.balance += value;
+
+            // Amsterdam (EIP-7708): emit the transfer log.
+            if (m_rev >= EVMC_AMSTERDAM && address{msg.sender} != address{msg.recipient})
+                emit_transfer_log(msg.sender, msg.recipient, value);
         }
     }
 
@@ -447,6 +527,29 @@ void Host::emit_log(const address& addr, const uint8_t* data, size_t data_size,
     const bytes32 topics[], size_t topics_count) noexcept
 {
     m_logs.push_back({addr, {data, data_size}, {topics, topics + topics_count}});
+}
+
+void Host::emit_transfer_log(
+    const address& sender, const address& recipient, const intx::uint256& amount) noexcept
+{
+    // EIP-7708: LOG3 from the system address with the ERC-20 Transfer topic.
+    static constexpr auto SYSTEM_ADDRESS = 0xfffffffffffffffffffffffffffffffffffffffe_address;
+    // keccak256("Transfer(address,address,uint256)")
+    static constexpr auto TRANSFER_TOPIC =
+        0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef_bytes32;
+
+    if (amount == 0)
+        return;
+
+    bytes32 sender_topic{};
+    bytes32 recipient_topic{};
+    std::copy_n(sender.bytes, sizeof(sender.bytes), &sender_topic.bytes[12]);
+    std::copy_n(recipient.bytes, sizeof(recipient.bytes), &recipient_topic.bytes[12]);
+
+    const bytes32 topics[3]{TRANSFER_TOPIC, sender_topic, recipient_topic};
+    const auto data = intx::be::store<bytes32>(amount);
+    m_logs.push_back({SYSTEM_ADDRESS, {data.bytes, sizeof(data.bytes)},
+        {topics, topics + std::size(topics)}});
 }
 
 evmc_access_status Host::access_account(const address& addr) noexcept

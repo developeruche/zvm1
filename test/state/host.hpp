@@ -44,6 +44,11 @@ class Host : public evmc::Host
     const Transaction& m_tx;
     std::vector<Log> m_logs;
 
+    /// Amsterdam (EIP-8037/8038): state gas consumed so far. Charged as
+    /// (spilled) regular gas by the instructions; tallied here so the
+    /// caller can split the two dimensions for EIP-7778 block accounting.
+    int64_t m_state_gas_used = 0;
+
 public:
     Host(evmc_revision rev, evmc::VM& vm, State& state, const BlockInfo& block,
         const BlockHashes& block_hashes, const Transaction& tx) noexcept
@@ -51,6 +56,17 @@ public:
     {}
 
     [[nodiscard]] std::vector<Log>&& take_logs() noexcept { return std::move(m_logs); }
+
+    [[nodiscard]] int64_t state_gas_used() const noexcept { return m_state_gas_used; }
+
+    /// Adjust the Amsterdam state-gas tally (callable by the transition
+    /// layer for top-frame and authorization charges).
+    void add_state_gas(int64_t amount) noexcept { m_state_gas_used += amount; }
+
+    /// Emit the EIP-7708 ETH transfer log (Amsterdam). No-op for zero
+    /// amounts or self-transfers.
+    void emit_transfer_log(
+        const address& sender, const address& recipient, const intx::uint256& amount) noexcept;
 
     evmc::Result call(const evmc_message& msg) noexcept override;
 
