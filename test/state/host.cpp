@@ -341,10 +341,13 @@ evmc::Result Host::create(const evmc_message& msg) noexcept
     if (result.status_code != EVMC_SUCCESS)
     {
         // The failed frame's state rolls back, so its NEW_ACCOUNT state gas
-        // is credited back (EELS credit_state_gas_refund on child error).
+        // rolls back with it — but only a REVERT returns the gas (EELS
+        // refill_frame_state_gas: an exceptional halt consumes gas_left
+        // after the refill, so the charge is burned with the frame).
         if (create_state_gas != 0)
         {
-            result.gas_left += create_state_gas;
+            if (result.status_code == EVMC_REVERT)
+                result.gas_left += create_state_gas;
             m_state_gas_used -= create_state_gas;
         }
         result.create_address = msg.recipient;
