@@ -473,6 +473,7 @@ evmc::Result Host::call(const evmc_message& orig_msg) noexcept
 
     const auto logs_checkpoint = m_logs.size();
     const auto state_checkpoint = m_state.checkpoint();
+    const auto state_gas_checkpoint = m_state_gas_used;
 
     auto result = execute_message(*msg);
 
@@ -481,6 +482,18 @@ evmc::Result Host::call(const evmc_message& orig_msg) noexcept
         static constexpr auto addr_03 = 0x03_address;
         auto* const acc_03 = m_state.find(addr_03);
         const auto is_03_touched = acc_03 != nullptr && acc_03->erase_if_empty;
+
+        // Amsterdam: the frame's state changes roll back, so the state gas
+        // its subtree consumed rolls back with them (EELS
+        // refill_frame_state_gas). A REVERT returns the refilled gas to the
+        // parent with gas_left; an exceptional halt consumes it anyway.
+        if (m_rev >= EVMC_AMSTERDAM)
+        {
+            const auto state_gas_delta = m_state_gas_used - state_gas_checkpoint;
+            m_state_gas_used = state_gas_checkpoint;
+            if (result.status_code == EVMC_REVERT && state_gas_delta > 0)
+                result.gas_left += state_gas_delta;
+        }
 
         // Revert.
         m_state.rollback(state_checkpoint);
