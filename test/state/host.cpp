@@ -531,6 +531,8 @@ evmc_tx_context Host::get_tx_context() const noexcept
         intx::be::store<uint256be>(m_block.blob_base_fee.value_or(0)),
         m_tx.blob_hashes.data(),
         m_tx.blob_hashes.size(),
+        nullptr,  // initcodes (TXCREATE) — unused here
+        0,        // initcodes_count
         m_block.slot_number,
     };
 }
