@@ -90,7 +90,7 @@ class ModArith
 public:
     constexpr explicit ModArith(const UintT& mod) noexcept
       : mod_{mod},
-#if defined SP1 || defined SP1TURBO || defined ZISK || defined RISC0
+#if defined SP1 || defined SP1TURBO || defined ZISK
         r_squared_{BN ? 1 : compute_r_squared(mod)},
         mod_inv_{BN ? 0 : compute_mont_mod_inv(mod)}
 #else
@@ -108,7 +108,7 @@ public:
     /// what gives aR²R⁻¹ % mod = aR % mod.
     constexpr UintT to_mont(const UintT& x) const noexcept
     {
-#if defined SP1 || defined SP1TURBO || defined ZISK || defined RISC0
+#if defined SP1 || defined SP1TURBO || defined ZISK
         if constexpr (BN)
             return x;
         else
@@ -122,7 +122,7 @@ public:
     /// Montgomery multiplication mul(x, 1) what gives aRR⁻¹ % mod = a % mod.
     constexpr UintT from_mont(const UintT& x) const noexcept
     {
-#if defined SP1 || defined SP1TURBO || defined ZISK || defined RISC0
+#if defined SP1 || defined SP1TURBO || defined ZISK
         if constexpr (BN)
             return x;
         else
@@ -167,28 +167,6 @@ public:
                 reinterpret_cast<const uint64_t*>(&c0), reinterpret_cast<const uint64_t*>(&mod_),
                 reinterpret_cast<uint64_t*>(&res)};
             ZISK_SYSCALL(0x802, &params);
-            return res;
-        }
-#endif
-
-#if defined(RISC0)
-        // RISC0 256-bit modular-multiply accelerator (ecall ecall::BIGINT = 4):
-        //   sys_bigint(result, OP_MULTIPLY=0, x, y, modulus) => (x*y) mod modulus
-        // on canonical little-endian 256-bit values (WIDTH_WORDS = 8 × u32),
-        // exactly what the BN-accelerated (non-Montgomery) path needs.
-        if constexpr (BN)
-        {
-            UintT res;
-            register uint32_t t0 asm("t0") = 4;  // ecall::BIGINT
-            register uint32_t a0 asm("a0") = reinterpret_cast<uint32_t>(&res);
-            register uint32_t a1 asm("a1") = 0;  // bigint::OP_MULTIPLY
-            register uint32_t a2 asm("a2") = reinterpret_cast<uint32_t>(&x);
-            register uint32_t a3 asm("a3") = reinterpret_cast<uint32_t>(&y);
-            register uint32_t a4 asm("a4") = reinterpret_cast<uint32_t>(&mod_);
-            asm volatile("ecall"
-                         : "+r"(a0), "+r"(a1)
-                         : "r"(t0), "r"(a2), "r"(a3), "r"(a4)
-                         : "memory");
             return res;
         }
 #endif

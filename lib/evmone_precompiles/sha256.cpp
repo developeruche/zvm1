@@ -223,40 +223,6 @@ static bool calc_chunk(uint8_t chunk[CHUNK_SIZE], struct BufferState* state)
         // literal rather than the constexpr name.
         ZISK_SYSCALL(0x805, &zisk_sha_params);
         (void)p;  // unused on the accelerated path
-#elif defined(RISC0)
-        // RISC0 SHA-256 compression accelerator (ecall ecall::SHA = 3):
-        //   sys_sha_compress(out_state, in_state, block_half1, block_half2)
-        //   t0=3, a0=out, a1=in, a2=block1, a3=block2, a4=block count (1).
-        // The accelerator operates on state and message words in *big-endian*
-        // byte order (cf. risc0 SHA256_INIT = 0x6a09e667.to_be()), while evmone
-        // keeps the state as native-endian uint32_t.  So byte-swap h in/out.
-        // The 64-byte `chunk` already holds the message in big-endian word order
-        // (raw bytes); copy it into a word-aligned buffer and pass the two
-        // 32-byte halves.
-        {
-            uint32_t in_state[8];
-            uint32_t out_state[8];
-            for (j = 0; j < 8; ++j)
-                in_state[j] = __builtin_bswap32(h[j]);
-
-            uint32_t block[16];
-            memcpy(block, chunk, CHUNK_SIZE);
-
-            register uint32_t t0 asm("t0") = 3;  // ecall::SHA
-            register uint32_t a0 asm("a0") = reinterpret_cast<uint32_t>(out_state);
-            register uint32_t a1 asm("a1") = reinterpret_cast<uint32_t>(in_state);
-            register uint32_t a2 asm("a2") = reinterpret_cast<uint32_t>(&block[0]);
-            register uint32_t a3 asm("a3") = reinterpret_cast<uint32_t>(&block[8]);
-            register uint32_t a4 asm("a4") = 1;  // one 64-byte block
-            asm volatile("ecall"
-                         : "+r"(a0), "+r"(a1)
-                         : "r"(t0), "r"(a2), "r"(a3), "r"(a4)
-                         : "memory");
-
-            for (j = 0; j < 8; ++j)
-                h[j] = __builtin_bswap32(out_state[j]);
-        }
-        (void)p;  // unused on the accelerated path
 #elif defined(OPENVM)
         // OpenVM SHA-256 compression precompile — single-shot over the raw
         // 64-byte block, no separate message-schedule "extend" step needed
